@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Node.js Hyperswarm clients can now connect to a firewalled peeroxide server. Before, every attempt timed out (`passive holepunch timed out` here, `HOLEPUNCH_ABORTED` on the Node side). The server side of the handshake now matches Node hyperdht `lib/server.js` on three points:
+  - **Duplicate PEER_HANDSHAKE.** A Node client sends one Noise message through up to two relays in parallel and acts on the first reply. Each copy now gets the same reply, cached by the Noise message for 20 s. Before, each copy got a fresh Noise responder, and the second replaced the first's holepunch session.
+  - **Holepunch relays.** The reply's `holepunch.relays[].peer_address` is now our own address as each relay saw it (`HyperDhtHandle::current_relays()`). Before, it held the client's address, so the relay sent the client's PEER_HOLEPUNCH back to the client.
+  - **Open or direct clients.** A client that says it is `FIREWALL_OPEN`, or that reached us without a relay, is now dialled directly, as Node does. Before, it was given a holepunch, while the Node client waited for that dial.
+
 ## [1.7.3](https://github.com/Rightbracket/peeroxide/compare/peeroxide-v1.7.2...peeroxide-v1.7.3) - 2026-07-12
 
 ### Other

@@ -18,8 +18,8 @@ use peeroxide_dht::hyperdht::{
 };
 use peeroxide_dht::hyperdht_messages::{
     encode_handshake_to_bytes, encode_holepunch_msg_to_bytes, HandshakeMessage, HolepunchInfo,
-    HolepunchMessage, HolepunchPayload, NoisePayload, RelayInfo, RelayThroughInfo,
-    SecretStreamInfo, UdxInfo, ERROR_NONE, FIREWALL_CONSISTENT, FIREWALL_RANDOM, FIREWALL_UNKNOWN,
+    HolepunchMessage, HolepunchPayload, NoisePayload, RelayThroughInfo, SecretStreamInfo, UdxInfo,
+    ERROR_NONE, FIREWALL_CONSISTENT, FIREWALL_OPEN, FIREWALL_RANDOM, FIREWALL_UNKNOWN,
     MODE_FROM_RELAY, MODE_FROM_SECOND_RELAY, MODE_FROM_SERVER, MODE_REPLY,
 };
 use peeroxide_dht::messages::Ipv4Peer;
@@ -42,6 +42,12 @@ fn next_stream_id() -> u32 {
 
 const DEFAULT_MAX_PEERS: usize = 64;
 const DEFAULT_MAX_PARALLEL: usize = 3;
+
+/// How long the reply to a server-side PEER_HANDSHAKE is kept for duplicates
+/// of the same request: the passive holepunch window (10 s) plus the 10 s
+/// Node hyperdht keeps a settled handshake around (`HANDSHAKE_CLEAR_WAIT` in
+/// `lib/server.js`).
+const HANDSHAKE_REPLY_TTL: Duration = Duration::from_secs(20);
 
 // ── Retry backoff tiers (matching Node.js lib/retry-timer.js) ────────────────
 // Each tier: [base_ms, jitter1, jitter2, jitter3]
@@ -352,6 +358,76 @@ struct SwarmActor {
     pending_handshakes: HashMap<[u8; 32], u64>,
     next_holepunch_id: u64,
     passive_hp_event_tx: mpsc::UnboundedSender<PassiveHolepunchEvent>,
+
+    // Noise replies to recent PEER_HANDSHAKEs, keyed by the client's Noise
+    // message. A Node client sends the same message through up to two relays
+    // in parallel and keeps the first reply; every copy must get that reply.
+    handshake_replies: HandshakeReplyCache,
+}
+
+/// Noise replies to recent server-side PEER_HANDSHAKE requests, keyed by the
+/// client's Noise message.
+///
+/// Node hyperdht clients send one handshake through up to two relays at once
+/// (`lib/connect.js`, `Semaphore(2)`) and act on whichever reply arrives
+/// first, so a server must answer every copy identically, as Node's
+/// `Server._onpeerhandshake` does. Answering each copy with a fresh Noise
+/// responder gives the client a reply for a session the server then replaces.
+struct HandshakeReplyCache {
+    ttl: Duration,
+    entries: HashMap<Vec<u8>, (tokio::time::Instant, Vec<u8>)>,
+}
+
+impl HandshakeReplyCache {
+    fn new(ttl: Duration) -> Self {
+        Self {
+            ttl,
+            entries: HashMap::new(),
+        }
+    }
+
+    /// The Noise reply already sent for this client Noise message, if any.
+    fn get(&mut self, client_noise: &[u8]) -> Option<Vec<u8>> {
+        self.prune();
+        self.entries.get(client_noise).map(|(_, reply)| reply.clone())
+    }
+
+    fn insert(&mut self, client_noise: Vec<u8>, reply_noise: Vec<u8>) {
+        self.prune();
+        self.entries.insert(client_noise, (tokio::time::Instant::now(), reply_noise));
+    }
+
+    fn prune(&mut self) {
+        let ttl = self.ttl;
+        self.entries.retain(|_, (at, _)| at.elapsed() < ttl);
+    }
+}
+
+/// Wrap a Noise reply in the handshake envelope for the path the request took.
+///
+/// Per Node `lib/server.js _addHandshake`:
+///   - inbound FROM_CLIENT → respond MODE_REPLY (direct reply path).
+///   - inbound FROM_RELAY / FROM_SECOND_RELAY → respond MODE_FROM_SERVER
+///     with peer_address pointing to the originating client (carried in
+///     the inbound msg.peer_address). The dht layer will dispatch this
+///     via dht.relay_with_tid back to the FE-holder, which then routes
+///     a tid-preserved REPLY to the receiver.
+fn encode_server_handshake_reply(
+    inbound_mode: u64,
+    peer_address: Option<Ipv4Peer>,
+    noise_reply: Vec<u8>,
+) -> Option<Vec<u8>> {
+    let (mode, peer_address) = match inbound_mode {
+        MODE_FROM_RELAY | MODE_FROM_SECOND_RELAY => (MODE_FROM_SERVER, peer_address),
+        _ => (MODE_REPLY, None),
+    };
+    encode_handshake_to_bytes(&HandshakeMessage {
+        mode,
+        noise: noise_reply,
+        peer_address,
+        relay_address: None,
+    })
+    .ok()
 }
 
 /// State carried between the initial server handshake and the moment the
@@ -490,6 +566,7 @@ pub async fn spawn(
         pending_handshakes: HashMap::new(),
         next_holepunch_id: 0,
         passive_hp_event_tx,
+        handshake_replies: HandshakeReplyCache::new(HANDSHAKE_REPLY_TTL),
     };
 
     // Keep the DHT runtime alive for the swarm's lifetime.
@@ -942,6 +1019,17 @@ impl SwarmActor {
             );
         }
 
+        // The same request relayed by another node: answer with the same reply.
+        if let Some(noise_reply) = self.handshake_replies.get(&msg.noise) {
+            tracing::debug!(
+                relay = %format!("{}:{}", from.host, from.port),
+                "server handshake: duplicate of an answered handshake, resending its reply"
+            );
+            let reply = encode_server_handshake_reply(msg.mode, peer_address, noise_reply);
+            let _ = reply_tx.send(reply);
+            return;
+        }
+
         let noise_kp = NoiseKeypair {
             public_key: self.key_pair.public_key,
             secret_key: self.key_pair.secret_key,
@@ -986,10 +1074,16 @@ impl SwarmActor {
         //     sure, in which case the existing direct path is the safer
         //     choice (Node hyperdht has the same gate), AND
         //   - we are not forcing all server connections through a relay
-        //     (relay_through bypasses NAT traversal entirely).
+        //     (relay_through bypasses NAT traversal entirely), AND
+        //   - the client cannot simply be dialled. Node `lib/server.js
+        //     _addHandshake` dials a client that says it is FIREWALL_OPEN, or
+        //     that reached us directly rather than through a relay, and such a
+        //     client waits for that dial instead of holepunching.
         let firewall_state = self.dht.firewalled().await.unwrap_or(FIREWALL_UNKNOWN);
+        let client_dialable = remote_payload.firewall == FIREWALL_OPEN || !is_forwarded;
         let attempt_holepunch = matches!(firewall_state, FIREWALL_CONSISTENT | FIREWALL_RANDOM)
-            && relay_through_info.is_none();
+            && relay_through_info.is_none()
+            && !client_dialable;
 
         // Try to stage the passive Holepuncher up front so the reply we
         // send in this handshake can advertise the puncher's bound port
@@ -1027,20 +1121,12 @@ impl SwarmActor {
             .map_or(self.local_port, |s| s.puncher_port);
         let addresses4 = self.dht.noise_addresses4(advertise_port).await;
 
-        let holepunch_info = holepunch_setup.as_ref().map(|setup| {
-            let relays: Vec<RelayInfo> = self
-                .dht
-                .current_relay_addresses()
-                .into_iter()
-                .map(|relay_addr| RelayInfo {
-                    relay_address: relay_addr,
-                    peer_address: client_address.clone(),
-                })
-                .collect();
-            HolepunchInfo {
-                id: setup.id,
-                relays,
-            }
+        // A client sends its PEER_HOLEPUNCH to `relay_address`, and the relay
+        // forwards it to `peer_address`: that must be our own address as the
+        // relay saw it (Node `Announcer.relays`), not the client's.
+        let holepunch_info = holepunch_setup.as_ref().map(|setup| HolepunchInfo {
+            id: setup.id,
+            relays: self.dht.current_relays(),
         });
 
         let reply_payload = NoisePayload {
@@ -1090,28 +1176,12 @@ impl SwarmActor {
             }
         };
 
-        // Encode reply with mode + peer_address derived from inbound mode.
-        // Per Node `lib/server.js _addHandshake`:
-        //   - inbound FROM_CLIENT → respond MODE_REPLY (direct reply path).
-        //   - inbound FROM_RELAY / FROM_SECOND_RELAY → respond MODE_FROM_SERVER
-        //     with peer_address pointing to the originating client (carried in
-        //     the inbound msg.peer_address). The dht layer will dispatch this
-        //     via dht.relay_with_tid back to the FE-holder, which then routes
-        //     a tid-preserved REPLY to the receiver.
-        let (reply_mode, reply_peer_address) = match msg.mode {
-            MODE_FROM_RELAY | MODE_FROM_SECOND_RELAY => {
-                (MODE_FROM_SERVER, peer_address.clone())
-            }
-            _ => (MODE_REPLY, None),
-        };
-
-        let reply_msg = HandshakeMessage {
-            mode: reply_mode,
-            noise: noise_reply,
-            peer_address: reply_peer_address,
-            relay_address: None,
-        };
-        let _ = reply_tx.send(encode_handshake_to_bytes(&reply_msg).ok());
+        self.handshake_replies.insert(msg.noise.clone(), noise_reply.clone());
+        let _ = reply_tx.send(encode_server_handshake_reply(
+            msg.mode,
+            peer_address.clone(),
+            noise_reply,
+        ));
 
         let remote_pk = nw_result.remote_public_key;
 
@@ -1803,6 +1873,48 @@ mod tests {
         let j = JoinOpts::default();
         assert!(j.server);
         assert!(j.client);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn handshake_reply_cache_returns_the_first_reply_until_it_expires() {
+        let mut cache = HandshakeReplyCache::new(Duration::from_secs(20));
+        assert!(cache.get(b"noise-a").is_none());
+
+        cache.insert(b"noise-a".to_vec(), b"reply-a".to_vec());
+        assert_eq!(cache.get(b"noise-a").as_deref(), Some(&b"reply-a"[..]));
+        assert!(cache.get(b"noise-b").is_none(), "other handshakes are not affected");
+
+        tokio::time::advance(Duration::from_secs(19)).await;
+        assert_eq!(cache.get(b"noise-a").as_deref(), Some(&b"reply-a"[..]));
+
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert!(cache.get(b"noise-a").is_none());
+        assert!(cache.entries.is_empty(), "expired entries are dropped");
+    }
+
+    #[test]
+    fn server_handshake_reply_follows_the_inbound_mode() {
+        use peeroxide_dht::hyperdht_messages::{decode_handshake_from_bytes, MODE_FROM_CLIENT};
+
+        let client = Ipv4Peer {
+            host: "10.0.0.1".to_string(),
+            port: 4000,
+        };
+
+        for inbound in [MODE_FROM_RELAY, MODE_FROM_SECOND_RELAY] {
+            let bytes = encode_server_handshake_reply(inbound, Some(client.clone()), vec![7; 48])
+                .expect("encode");
+            let m = decode_handshake_from_bytes(&bytes).expect("decode");
+            assert_eq!(m.mode, MODE_FROM_SERVER);
+            assert_eq!(m.peer_address.as_ref(), Some(&client));
+            assert_eq!(m.noise, vec![7; 48]);
+        }
+
+        let bytes = encode_server_handshake_reply(MODE_FROM_CLIENT, Some(client), vec![7; 48])
+            .expect("encode");
+        let m = decode_handshake_from_bytes(&bytes).expect("decode");
+        assert_eq!(m.mode, MODE_REPLY);
+        assert!(m.peer_address.is_none());
     }
 
     #[tokio::test]

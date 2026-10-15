@@ -163,12 +163,17 @@ Passing result: Protomux framing and blind-relay control messages are byte-ident
 
 | Suite | Command | Type | Count |
 |-------|---------|------|-------|
-| Unit tests (peeroxide) | `cargo test -p peeroxide --lib` | Unit | 21 |
-| Live interop | `cargo test -p peeroxide --test hyperswarm_interop` | Live | 1 |
+| Unit tests (peeroxide) | `cargo test -p peeroxide --lib` | Unit | 26 |
+| Live interop | `cargo test -p peeroxide --test hyperswarm_interop` | Live | 3 |
+| Duplicate handshake | `cargo test -p peeroxide --test server_handshake_dedup` | Integration | 1 |
 
-**Node helper**: `tests/node/hyperswarm-server.js` (spawned automatically by live interop test)
+**Node helper**: `tests/node/hyperswarm-server.js` (spawned automatically by live interop test). Flags: `--remote-client` (the Node client skips the same-host LAN shortcut, as on another network, and one more DHT node is started so it can classify its NAT) and `--open-client` (the Node client's DHT node is reachable, like a peer with a public address).
 
-Passing result: Rust Hyperswarm client connects to a Node.js `hyperswarm` server over the DHT. Full flow: DHT bootstrap → topic announce/lookup → PEER_HANDSHAKE → skip-holepunching (same-host) → UDX stream → SecretStream encrypted channel → receive "hello from node". Verifies end-to-end interoperability of the complete Hyperswarm stack.
+Passing result:
+- `hyperswarm_cross_language_connect`: Rust Hyperswarm client connects to a Node.js `hyperswarm` server over the DHT. Full flow: DHT bootstrap → topic announce/lookup → PEER_HANDSHAKE → skip-holepunching (same-host) → UDX stream → SecretStream encrypted channel → receive "hello from node". Verifies end-to-end interoperability of the complete Hyperswarm stack.
+- `hyperswarm_node_client_holepunches_to_rust_server`: a firewalled Node.js client connects to a firewalled Rust server. The client sends one PEER_HANDSHAKE through two relays in parallel, then holepunches through the relays the server advertised; data flows both ways.
+- `hyperswarm_open_node_client_connects_to_rust_server`: a reachable Node.js client waits for the firewalled Rust server to dial it, as a Node server would; data flows both ways.
+- `server_handshake_dedup`: a Rust client sends the same PEER_HANDSHAKE twice to a swarm server and gets byte-identical replies.
 
 ### Live Network Validation
 

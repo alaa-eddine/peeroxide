@@ -5,6 +5,16 @@ const Hyperswarm = require('hyperswarm')
 const b4a = require('b4a')
 const readline = require('readline')
 
+// Optional flags, used by the Node-client tests (no flag: unchanged behaviour).
+//   --remote-client  the client skips hyperdht's same-host LAN shortcut, as a
+//                    client on another network would; every node here is on
+//                    127.0.0.1, so it would otherwise always take it. One more
+//                    DHT node is started: a holepunching client needs 3 NAT
+//                    samples (hyperdht lib/nat.js) before it will punch.
+//   --open-client    the client's DHT node is reachable (firewalled: false),
+//                    like a peer with a public address.
+const flags = new Set(process.argv.slice(2))
+
 async function main () {
   const bootstrap = new DHT({
     ephemeral: false,
@@ -22,8 +32,24 @@ async function main () {
   await node1.fullyBootstrapped()
   await node2.fullyBootstrapped()
 
-  const serverDht = new DHT({ host: '127.0.0.1', bootstrap: bsAddr })
+  const extraNodes = []
+  if (flags.has('--remote-client')) {
+    const node3 = new DHT({ ephemeral: false, firewalled: false, host: '127.0.0.1', bootstrap: bsAddr })
+    await node3.fullyBootstrapped()
+    extraNodes.push(node3)
+  }
+
+  const serverDht = new DHT({
+    host: '127.0.0.1',
+    bootstrap: bsAddr,
+    ...(flags.has('--open-client') ? { ephemeral: false, firewalled: false } : {})
+  })
   await serverDht.fullyBootstrapped()
+
+  if (flags.has('--remote-client')) {
+    const connect = serverDht.connect.bind(serverDht)
+    serverDht.connect = (publicKey, opts = {}) => connect(publicKey, { ...opts, localConnection: false })
+  }
 
   const swarm = new Hyperswarm({ dht: serverDht })
 
@@ -127,6 +153,9 @@ async function main () {
 
   async function cleanup () {
     try { await swarm.destroy() } catch (_) {}
+    for (const node of extraNodes) {
+      try { await node.destroy() } catch (_) {}
+    }
     try { await node2.destroy() } catch (_) {}
     try { await node1.destroy() } catch (_) {}
     try { await bootstrap.destroy() } catch (_) {}
