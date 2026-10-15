@@ -70,6 +70,16 @@ const DEFAULT_MAX_PARALLEL: usize = 3;
 /// `lib/server.js`).
 const HANDSHAKE_REPLY_TTL: Duration = Duration::from_secs(20);
 
+/// An outgoing connection attempt that has not completed by then counts as
+/// failed (and is retried with backoff). Without a bound, a slow attempt (some
+/// take minutes) holds one of the `max_parallel` dial slots the whole time.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(25);
+
+/// How long a server handshake may spend sampling our NAT from the puncher
+/// socket. The sampling runs inside the swarm's event loop; Node runs it in the
+/// background, so a burst of handshakes cannot hold up everything else.
+const HANDSHAKE_SAMPLE_BUDGET: Duration = Duration::from_millis(1000);
+
 // ── Retry backoff tiers (matching Node.js lib/retry-timer.js) ────────────────
 // Each tier: [base_ms, jitter1, jitter2, jitter3]
 // Delay = base + rand(0..j1) + rand(0..j2) + rand(0..j3)
@@ -1042,10 +1052,15 @@ impl SwarmActor {
             tokio::spawn(async move {
                 let conn_runtime = UdxRuntime::shared(rh);
                 tracing::debug!(pk = %short_hex(&pk), "connecting to peer");
-                match dht
-                    .connect_with_options(&key_pair, pk, &relay_addrs, &conn_runtime, connect_opts)
-                    .await
-                {
+                let attempt = dht.connect_with_options(&key_pair, pk, &relay_addrs, &conn_runtime, connect_opts);
+                let outcome = match tokio::time::timeout(CONNECT_TIMEOUT, attempt).await {
+                    Ok(r) => r,
+                    Err(_) => Err(peeroxide_dht::hyperdht::HyperDhtError::HandshakeFailed(format!(
+                        "connect timed out after {}s",
+                        CONNECT_TIMEOUT.as_secs()
+                    ))),
+                };
+                match outcome {
                     Ok(conn) => {
                         tracing::info!(
                             target: "peeroxide::_events::peer::connected",
@@ -1543,7 +1558,7 @@ impl SwarmActor {
         // the passive NAT stays UNKNOWN and the coerce_firewall revert
         // (removing UNKNOWN→CONSISTENT) would break the passive punch path.
         // Mirrors Node lib/holepuncher.js:13-20.
-        let _added = puncher.auto_sample(self.dht.dht()).await;
+        let _added = tokio::time::timeout(HANDSHAKE_SAMPLE_BUDGET, puncher.auto_sample(self.dht.dht())).await;
 
         let socket_ref = puncher.primary_socket().ok_or_else(|| {
             SwarmError::Dht(HyperDhtError::StreamEstablishment(
