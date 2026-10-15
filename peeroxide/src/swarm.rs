@@ -1089,16 +1089,13 @@ impl SwarmActor {
             Ok((conn, runtime)) => {
                 let pk = result.public_key;
 
-                // Dedup: compare public keys to decide tie-break
-                if self.connections.has(&pk) {
-                    let we_are_dominant = self.key_pair.public_key > pk;
-                    if let Some(existing) = self.connections.get(&pk) {
-                        if existing.is_initiator == we_are_dominant {
-                            tracing::debug!(pk = %short_hex(&pk), "dedup: keeping existing");
-                            return;
-                        }
-                    }
-                    self.connections.remove(&pk);
+                // A newer connection to the same peer replaces the existing one, as
+                // Hyperswarm does once the existing stream has carried data (the
+                // other side most likely lost it and reconnected). The application
+                // gets the new connection; the old one is forgotten here and its
+                // CloseGuard is ignored when it is dropped.
+                if self.connections.remove(&pk) {
+                    tracing::debug!(pk = %short_hex(&pk), "dedup: replacing existing connection");
                 }
 
                 let conn_id = next_conn_id();
@@ -1386,9 +1383,11 @@ impl SwarmActor {
             return;
         }
 
-        if self.connections.has(&remote_pk) {
-            tracing::debug!(pk = %short_hex(&remote_pk), "server: already connected");
-            return;
+        // A peer that dials us again while we still hold a connection to it most
+        // likely restarted or lost that connection: take the new one (Hyperswarm).
+        let replacing = self.connections.remove(&remote_pk);
+        if replacing {
+            tracing::debug!(pk = %short_hex(&remote_pk), "server: replacing existing connection");
         }
         if self.connections.len() >= self.config.max_peers {
             tracing::debug!("server: at max connections");
@@ -1767,12 +1766,11 @@ impl SwarmActor {
                 }
                 self.pending_handshakes.remove(&entry.remote_pk);
 
-                if self.connections.has(&entry.remote_pk) {
+                if self.connections.remove(&entry.remote_pk) {
                     tracing::debug!(
                         pk = %short_hex(&entry.remote_pk),
-                        "passive holepunch landed but already connected; dropping"
+                        "passive holepunch landed: replacing existing connection"
                     );
-                    return;
                 }
                 if self.connections.len() >= self.config.max_peers {
                     tracing::debug!("passive holepunch landed but at max connections");

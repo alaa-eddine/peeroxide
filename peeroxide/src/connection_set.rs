@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 pub(crate) struct ConnectionInfo {
+    #[allow(dead_code)] // no longer used for tie-breaks: a newer connection always wins
     pub is_initiator: bool,
     /// Matches the [`crate::swarm::SwarmConnection`] handed to the application,
     /// so dropping an old, replaced connection does not release the new one.
