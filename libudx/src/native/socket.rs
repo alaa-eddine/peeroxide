@@ -15,6 +15,14 @@ pub struct Datagram {
     pub addr: SocketAddr,
 }
 
+/// Receive errors that concern an earlier send, not the socket itself.
+fn is_transient_recv_error(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionRefused
+    )
+}
+
 struct UdxSocketInner {
     udp: OnceLock<Arc<tokio::net::UdpSocket>>,
     recv_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -54,7 +62,17 @@ impl UdxSocketInner {
 
         let handle = tokio::spawn(async move {
             let mut buf = vec![0u8; 65536];
-            while let Ok((len, addr)) = udp.recv_from(&mut buf).await {
+            loop {
+                let (len, addr) = match udp.recv_from(&mut buf).await {
+                    Ok(r) => r,
+                    // Windows reports an ICMP "port unreachable" for an earlier send
+                    // (a peer whose process exited) as WSAECONNRESET on the next
+                    // recv_from. It says nothing about this socket: keep receiving.
+                    // Ending the loop here left the socket deaf for good. libuv
+                    // turns this reporting off (SIO_UDP_CONNRESET) for the same reason.
+                    Err(e) if is_transient_recv_error(&e) => continue,
+                    Err(_) => break,
+                };
                 let packet = buf[..len].to_vec();
 
                 if len >= super::header::HEADER_SIZE {
