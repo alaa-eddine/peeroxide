@@ -2,6 +2,9 @@ use std::collections::HashMap;
 
 pub(crate) struct ConnectionInfo {
     pub is_initiator: bool,
+    /// Matches the [`crate::swarm::SwarmConnection`] handed to the application,
+    /// so dropping an old, replaced connection does not release the new one.
+    pub id: u64,
 }
 
 pub(crate) struct ConnectionSet {
@@ -45,7 +48,7 @@ mod tests {
         let mut set = ConnectionSet::new();
         let pk = [1u8; 32];
         assert!(!set.has(&pk));
-        set.add(pk, ConnectionInfo { is_initiator: true });
+        set.add(pk, ConnectionInfo { is_initiator: true, id: 1 });
         assert!(set.has(&pk));
         assert_eq!(set.len(), 1);
     }
@@ -54,7 +57,7 @@ mod tests {
     fn remove() {
         let mut set = ConnectionSet::new();
         let pk = [2u8; 32];
-        set.add(pk, ConnectionInfo { is_initiator: false });
+        set.add(pk, ConnectionInfo { is_initiator: false, id: 2 });
         assert!(set.remove(&pk));
         assert!(!set.has(&pk));
         assert_eq!(set.len(), 0);
@@ -64,7 +67,7 @@ mod tests {
     fn get_info() {
         let mut set = ConnectionSet::new();
         let pk = [3u8; 32];
-        set.add(pk, ConnectionInfo { is_initiator: true });
+        set.add(pk, ConnectionInfo { is_initiator: true, id: 1 });
         let info = set.get(&pk).expect("should exist");
         assert!(info.is_initiator);
     }

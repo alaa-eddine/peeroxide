@@ -30,6 +30,11 @@ pub(crate) enum DiscoveryEvent {
     RefreshComplete {
         topic: [u8; 32],
     },
+    /// A retry backoff (or a reconnect after a dropped connection) elapsed:
+    /// dial this peer again now.
+    Retry {
+        public_key: [u8; 32],
+    },
 }
 
 pub(crate) struct PeerDiscoveryConfig {
@@ -45,6 +50,7 @@ pub(crate) async fn run_discovery(
     relay_addresses: Vec<Ipv4Peer>,
     event_tx: mpsc::UnboundedSender<DiscoveryEvent>,
     mut cancel_rx: tokio::sync::oneshot::Receiver<()>,
+    mut refresh_rx: mpsc::UnboundedReceiver<()>,
 ) {
     do_refresh(&config, &dht, &key_pair, &relay_addresses, &event_tx).await;
 
@@ -54,6 +60,9 @@ pub(crate) async fn run_discovery(
 
         tokio::select! {
             _ = tokio::time::sleep(delay) => {
+                do_refresh(&config, &dht, &key_pair, &relay_addresses, &event_tx).await;
+            }
+            Some(()) = refresh_rx.recv() => {
                 do_refresh(&config, &dht, &key_pair, &relay_addresses, &event_tx).await;
             }
             _ = &mut cancel_rx => break,

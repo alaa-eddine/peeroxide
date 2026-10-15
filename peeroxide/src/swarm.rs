@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use rand::Rng;
@@ -38,6 +38,27 @@ static NEXT_STREAM_ID: AtomicU32 = AtomicU32::new(1);
 
 fn next_stream_id() -> u32 {
     NEXT_STREAM_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_conn_id() -> u64 {
+    NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Tells the swarm when the application drops a [`SwarmConnection`], so it
+/// forgets that connection and can reconnect to (or accept) the peer again.
+/// Node Hyperswarm learns the same thing from the stream's `close` event.
+struct CloseGuard {
+    public_key: [u8; 32],
+    id: u64,
+    tx: mpsc::UnboundedSender<([u8; 32], u64)>,
+}
+
+impl Drop for CloseGuard {
+    fn drop(&mut self) {
+        let _ = self.tx.send((self.public_key, self.id));
+    }
 }
 
 const DEFAULT_MAX_PEERS: usize = 64;
@@ -169,6 +190,8 @@ pub struct SwarmConnection {
     /// Topic(s) associated with this connection.
     pub topics: Vec<[u8; 32]>,
     _runtime: UdxRuntime,
+    // Dropped with the connection: the swarm then releases its slot.
+    _close: Option<CloseGuard>,
 }
 
 impl SwarmConnection {
@@ -278,6 +301,50 @@ impl SwarmHandle {
         reply_rx.await.map_err(|_| SwarmError::ChannelClosed)?
     }
 
+    /// Connect to a peer by public key, outside any topic, and reconnect to it
+    /// whenever the connection drops, until [`Self::leave_peer`].
+    ///
+    /// Mirrors Node Hyperswarm's `joinPeer`.
+    pub async fn join_peer(&self, public_key: [u8; 32]) -> Result<(), SwarmError> {
+        self.cmd_tx
+            .send(SwarmCommand::JoinPeer { public_key })
+            .await
+            .map_err(|_| SwarmError::Destroyed)
+    }
+
+    /// Stop reconnecting to a peer added with [`Self::join_peer`]. An open
+    /// connection is left alone.
+    ///
+    /// Mirrors Node Hyperswarm's `leavePeer`.
+    pub async fn leave_peer(&self, public_key: [u8; 32]) -> Result<(), SwarmError> {
+        self.cmd_tx
+            .send(SwarmCommand::LeavePeer { public_key })
+            .await
+            .map_err(|_| SwarmError::Destroyed)
+    }
+
+    /// Never dial this peer again, and refuse its handshakes.
+    ///
+    /// Mirrors Node Hyperswarm's `PeerInfo.ban(true)`.
+    pub async fn ban_peer(&self, public_key: [u8; 32]) -> Result<(), SwarmError> {
+        self.cmd_tx
+            .send(SwarmCommand::BanPeer { public_key })
+            .await
+            .map_err(|_| SwarmError::Destroyed)
+    }
+
+    /// Run a joined topic's announce and lookup again now, instead of waiting
+    /// for the periodic refresh (useful when peers may have started at the same
+    /// moment).
+    ///
+    /// Mirrors Node Hyperswarm's `PeerDiscovery.refresh()`.
+    pub async fn refresh(&self, topic: [u8; 32]) -> Result<(), SwarmError> {
+        self.cmd_tx
+            .send(SwarmCommand::Refresh { topic })
+            .await
+            .map_err(|_| SwarmError::Destroyed)
+    }
+
     /// Destroy the swarm, cancelling all discovery and closing connections.
     pub async fn destroy(&self) -> Result<(), SwarmError> {
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -306,6 +373,18 @@ enum SwarmCommand {
     Destroy {
         reply_tx: oneshot::Sender<Result<(), SwarmError>>,
     },
+    JoinPeer {
+        public_key: [u8; 32],
+    },
+    LeavePeer {
+        public_key: [u8; 32],
+    },
+    BanPeer {
+        public_key: [u8; 32],
+    },
+    Refresh {
+        topic: [u8; 32],
+    },
 }
 
 #[allow(dead_code)] // Fields read during leave/unannounce (future)
@@ -313,6 +392,7 @@ struct TopicState {
     is_server: bool,
     is_client: bool,
     cancel_tx: Option<oneshot::Sender<()>>,
+    refresh_tx: mpsc::UnboundedSender<()>,
     refreshed: bool,
 }
 
@@ -363,6 +443,10 @@ struct SwarmActor {
     // message. A Node client sends the same message through up to two relays
     // in parallel and keeps the first reply; every copy must get that reply.
     handshake_replies: HandshakeReplyCache,
+
+    // Each SwarmConnection's CloseGuard reports (public key, connection id)
+    // here when the application drops it.
+    closed_tx: mpsc::UnboundedSender<([u8; 32], u64)>,
 }
 
 /// Noise replies to recent server-side PEER_HANDSHAKE requests, keyed by the
@@ -531,6 +615,7 @@ pub async fn spawn(
     let (conn_tx, conn_rx) = mpsc::channel(64);
     let (discovery_event_tx, discovery_event_rx) = mpsc::unbounded_channel();
     let (passive_hp_event_tx, passive_hp_event_rx) = mpsc::unbounded_channel();
+    let (closed_tx, closed_rx) = mpsc::unbounded_channel();
 
     let handle_dht = dht.clone();
     let handle_key_pair = key_pair.clone();
@@ -567,13 +652,16 @@ pub async fn spawn(
         next_holepunch_id: 0,
         passive_hp_event_tx,
         handshake_replies: HandshakeReplyCache::new(HANDSHAKE_REPLY_TTL),
+        closed_tx,
     };
 
     // Keep the DHT runtime alive for the swarm's lifetime.
     // We must await dht_join AFTER actor.run() (which calls dht.destroy()),
     // so the DhtNode finishes closing its IO sockets before we drop the runtime.
     let join = tokio::spawn(async move {
-        actor.run(cmd_rx, discovery_event_rx, server_rx, passive_hp_event_rx).await;
+        actor
+            .run(cmd_rx, discovery_event_rx, server_rx, passive_hp_event_rx, closed_rx)
+            .await;
         let _ = dht_join.await;
         drop(runtime);
     });
@@ -595,6 +683,7 @@ impl SwarmActor {
         mut discovery_rx: mpsc::UnboundedReceiver<DiscoveryEvent>,
         mut server_rx: mpsc::UnboundedReceiver<ServerEvent>,
         mut passive_hp_event_rx: mpsc::UnboundedReceiver<PassiveHolepunchEvent>,
+        mut closed_rx: mpsc::UnboundedReceiver<([u8; 32], u64)>,
     ) {
         let (connect_result_tx, mut connect_result_rx) =
             mpsc::unbounded_channel::<ConnectAttemptResult>();
@@ -611,8 +700,13 @@ impl SwarmActor {
             tokio::select! {
                 cmd = cmd_rx.recv() => {
                     let Some(cmd) = cmd else { break };
-                    if self.handle_command(cmd) {
+                    if self.handle_command(cmd, &connect_result_tx) {
                         break;
+                    }
+                }
+                closed = closed_rx.recv() => {
+                    if let Some((pk, id)) = closed {
+                        self.handle_connection_closed(pk, id);
                     }
                 }
                 event = discovery_rx.recv() => {
@@ -661,8 +755,46 @@ impl SwarmActor {
     }
 
     /// Returns `true` when the actor should shut down.
-    fn handle_command(&mut self, cmd: SwarmCommand) -> bool {
+    fn handle_command(
+        &mut self,
+        cmd: SwarmCommand,
+        connect_result_tx: &mpsc::UnboundedSender<ConnectAttemptResult>,
+    ) -> bool {
         match cmd {
+            SwarmCommand::JoinPeer { public_key } => {
+                if public_key != self.key_pair.public_key {
+                    let info = self
+                        .peers
+                        .entry(public_key)
+                        .or_insert_with(|| PeerInfo::new(public_key, vec![]));
+                    info.explicit = true;
+                    info.banned = false;
+                    info.set_waiting(false);
+                    self.requeue(public_key);
+                    self.attempt_connections(connect_result_tx);
+                }
+                false
+            }
+            SwarmCommand::LeavePeer { public_key } => {
+                if let Some(info) = self.peers.get_mut(&public_key) {
+                    info.explicit = false;
+                }
+                false
+            }
+            SwarmCommand::BanPeer { public_key } => {
+                self.peers
+                    .entry(public_key)
+                    .or_insert_with(|| PeerInfo::new(public_key, vec![]))
+                    .banned = true;
+                self.queue.retain(|pk| *pk != public_key);
+                false
+            }
+            SwarmCommand::Refresh { topic } => {
+                if let Some(state) = self.topics.get(&topic) {
+                    let _ = state.refresh_tx.send(());
+                }
+                false
+            }
             SwarmCommand::Join {
                 topic,
                 server,
@@ -711,6 +843,7 @@ impl SwarmActor {
         }
 
         let (cancel_tx, cancel_rx) = oneshot::channel();
+        let (refresh_tx, refresh_rx) = mpsc::unbounded_channel();
         let relay_addresses = self
             .relay_address
             .as_ref()
@@ -727,6 +860,7 @@ impl SwarmActor {
             relay_addresses,
             self.discovery_event_tx.clone(),
             cancel_rx,
+            refresh_rx,
         ));
 
         self.topics.insert(
@@ -735,6 +869,7 @@ impl SwarmActor {
                 is_server: server,
                 is_client: client,
                 cancel_tx: Some(cancel_tx),
+                refresh_tx,
                 refreshed: false,
             },
         );
@@ -822,7 +957,50 @@ impl SwarmActor {
                 self.attempt_connections(connect_result_tx);
                 self.check_flush_waiters();
             }
+            DiscoveryEvent::Retry { public_key } => {
+                if let Some(info) = self.peers.get_mut(&public_key) {
+                    info.set_waiting(false);
+                }
+                self.requeue(public_key);
+                self.attempt_connections(connect_result_tx);
+            }
         }
+    }
+
+    /// Queue a known peer for a dial unless it is connected, being dialled,
+    /// banned, waiting for its backoff, or no longer wanted (no topic left and
+    /// not added with `join_peer`).
+    fn requeue(&mut self, public_key: [u8; 32]) {
+        if self.connections.has(&public_key) || self.connections.len() >= self.config.max_peers {
+            return;
+        }
+        let Some(info) = self.peers.get_mut(&public_key) else {
+            return;
+        };
+        if info.queued || info.connecting || info.banned || info.is_waiting() {
+            return;
+        }
+        if info.topics.is_empty() && !info.explicit {
+            return;
+        }
+        info.queued = true;
+        info.priority = info.get_priority();
+        self.queue.push(public_key);
+    }
+
+    /// The application dropped a connection: release its slot and reconnect
+    /// with backoff if the peer is still wanted, as Node Hyperswarm does when a
+    /// connection closes.
+    fn handle_connection_closed(&mut self, public_key: [u8; 32], id: u64) {
+        if self.connections.get(&public_key).map(|c| c.id) != Some(id) {
+            return; // an older connection that was already replaced
+        }
+        self.connections.remove(&public_key);
+        tracing::debug!(pk = %short_hex(&public_key), "connection closed by the application");
+        if let Some(info) = self.peers.get_mut(&public_key) {
+            info.disconnected();
+        }
+        self.schedule_retry(public_key);
     }
 
     fn attempt_connections(
@@ -923,8 +1101,9 @@ impl SwarmActor {
                     self.connections.remove(&pk);
                 }
 
+                let conn_id = next_conn_id();
                 self.connections
-                    .add(pk, ConnectionInfo { is_initiator: true });
+                    .add(pk, ConnectionInfo { is_initiator: true, id: conn_id });
 
                 let topics = if let Some(info) = self.peers.get_mut(&pk) {
                     info.connected();
@@ -938,6 +1117,11 @@ impl SwarmActor {
                     is_initiator: true,
                     topics,
                     _runtime: runtime,
+                    _close: Some(CloseGuard {
+                        public_key: pk,
+                        id: conn_id,
+                        tx: self.closed_tx.clone(),
+                    }),
                 };
                 if self.conn_tx.try_send(swarm_conn).is_err() {
                     tracing::warn!("connection channel full, dropping connection");
@@ -956,24 +1140,19 @@ impl SwarmActor {
         let Some(info) = self.peers.get_mut(&pk) else {
             return;
         };
-        if info.banned || info.topics.is_empty() {
+        if info.banned || (info.topics.is_empty() && !info.explicit) || info.is_waiting() {
             return;
         }
 
         let delay = retry_delay(info);
         info.set_waiting(true);
 
-        let relay_addresses = info.relay_addresses.clone();
-        let topic = info.topics[0];
+        // The Retry event clears the waiting flag before requeueing; a plain
+        // PeerFound would be ignored while the peer is still marked waiting.
         let event_tx = self.discovery_event_tx.clone();
-
         tokio::spawn(async move {
             tokio::time::sleep(delay).await;
-            let _ = event_tx.send(DiscoveryEvent::PeerFound {
-                public_key: pk,
-                relay_addresses,
-                topic,
-            });
+            let _ = event_tx.send(DiscoveryEvent::Retry { public_key: pk });
         });
     }
 
@@ -1176,6 +1355,19 @@ impl SwarmActor {
             }
         };
 
+        // A banned peer gets no reply, like Node Hyperswarm's firewall.
+        if self
+            .peers
+            .get(&nw_result.remote_public_key)
+            .is_some_and(|p| p.banned)
+        {
+            if let Some(setup) = holepunch_setup {
+                setup.abort_task.abort();
+            }
+            let _ = reply_tx.send(None);
+            return;
+        }
+
         self.handshake_replies.insert(msg.noise.clone(), noise_reply.clone());
         let _ = reply_tx.send(encode_server_handshake_reply(
             msg.mode,
@@ -1211,8 +1403,14 @@ impl SwarmActor {
             }
         };
 
+        let conn_id = next_conn_id();
         self.connections
-            .add(remote_pk, ConnectionInfo { is_initiator: false });
+            .add(remote_pk, ConnectionInfo { is_initiator: false, id: conn_id });
+        let close = CloseGuard {
+            public_key: remote_pk,
+            id: conn_id,
+            tx: self.closed_tx.clone(),
+        };
 
         let conn_tx = self.conn_tx.clone();
 
@@ -1240,6 +1438,7 @@ impl SwarmActor {
                             is_initiator: false,
                             topics: vec![],
                             _runtime: runtime,
+                            _close: Some(close),
                         };
                         if conn_tx.send(swarm_conn).await.is_err() {
                             tracing::warn!("connection channel closed");
@@ -1268,6 +1467,7 @@ impl SwarmActor {
                             is_initiator: false,
                             topics: vec![],
                             _runtime: runtime,
+                            _close: Some(close),
                         };
                         if conn_tx.send(swarm_conn).await.is_err() {
                             tracing::warn!("connection channel closed");
@@ -1586,8 +1786,14 @@ impl SwarmActor {
                     "passive holepunch landed; finalizing SecretStream"
                 );
 
+                let conn_id = next_conn_id();
                 self.connections
-                    .add(entry.remote_pk, ConnectionInfo { is_initiator: false });
+                    .add(entry.remote_pk, ConnectionInfo { is_initiator: false, id: conn_id });
+                let close = CloseGuard {
+                    public_key: entry.remote_pk,
+                    id: conn_id,
+                    tx: self.closed_tx.clone(),
+                };
 
                 let runtime = UdxRuntime::shared(self.runtime_handle.clone());
                 let conn_tx = self.conn_tx.clone();
@@ -1622,6 +1828,7 @@ impl SwarmActor {
                         is_initiator: false,
                         topics: vec![],
                         _runtime: runtime,
+                        _close: Some(close),
                     };
                     if conn_tx.send(swarm_conn).await.is_err() {
                         tracing::warn!("connection channel closed");
