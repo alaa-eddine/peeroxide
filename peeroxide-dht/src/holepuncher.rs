@@ -37,6 +37,11 @@ const BIRTHDAY_SOCKETS: usize = 256;
 pub enum HolepunchEvent {
     Connected {
         addr: SocketAddr,
+        /// The socket the winning probe arrived on: the primary socket, or one of the
+        /// birthday-attack sockets opened for a RANDOM-class NAT. Only that socket's NAT
+        /// mapping reaches the peer, so the stream must use it (Node `connect.js` connects
+        /// the raw stream to `puncher.socket`, set to the socket that got the probe).
+        socket: Option<UdxSocket>,
     },
     Aborted,
 }
@@ -434,7 +439,8 @@ impl Holepuncher {
         self.connected = true;
         self.punching = false;
 
-        let _ = self.event_tx.send(HolepunchEvent::Connected { addr });
+        let socket = self.sockets.get(socket_idx).map(|s| s.socket.clone());
+        let _ = self.event_tx.send(HolepunchEvent::Connected { addr, socket });
     }
 
     fn done(&self) -> bool {
@@ -512,7 +518,7 @@ async fn run_recv_adapter(
                     addr = %probe.addr,
                     "holepuncher(initiator): probe received, firing Connected"
                 );
-                let _ = event_tx.send(HolepunchEvent::Connected { addr: probe.addr });
+                let _ = event_tx.send(HolepunchEvent::Connected { addr: probe.addr, socket: Some(socket.clone()) });
                 return;
             }
         } else {
@@ -673,8 +679,10 @@ mod recv_adapter_tests {
             .expect("Connected within 2s")
             .expect("event_rx open");
         match evt {
-            HolepunchEvent::Connected { addr } => {
+            HolepunchEvent::Connected { addr, socket } => {
                 assert_eq!(addr, probe_local, "Connected.addr matches probe source");
+                let socket = socket.expect("Connected carries the socket the probe arrived on");
+                assert_eq!(socket.local_addr().await.expect("local_addr"), target_addr, "the primary socket");
             }
             _ => panic!("expected Connected, got something else"),
         }
@@ -746,10 +754,18 @@ mod recv_adapter_tests {
             .expect("Connected within 2s")
             .expect("event_rx open");
         match evt {
-            HolepunchEvent::Connected { addr } => {
+            HolepunchEvent::Connected { addr, socket } => {
                 assert_eq!(
                     addr, probe_local,
                     "Connected fires from a probe landing on the birthday socket"
+                );
+                // The stream must leave from the birthday socket: through a RANDOM-class NAT,
+                // only its mapping reaches the peer.
+                let socket = socket.expect("Connected carries the winning socket");
+                assert_eq!(
+                    socket.local_addr().await.expect("local_addr"),
+                    extra_addr,
+                    "the winning socket is the birthday socket, not the primary one"
                 );
             }
             _ => panic!("expected Connected, got something else"),

@@ -65,15 +65,17 @@ const DEFAULT_MAX_PEERS: usize = 64;
 const DEFAULT_MAX_PARALLEL: usize = 3;
 
 /// How long the reply to a server-side PEER_HANDSHAKE is kept for duplicates
-/// of the same request: the passive holepunch window (10 s) plus the 10 s
+/// of the same request: the passive holepunch window (40 s) plus the 10 s
 /// Node hyperdht keeps a settled handshake around (`HANDSHAKE_CLEAR_WAIT` in
 /// `lib/server.js`).
-const HANDSHAKE_REPLY_TTL: Duration = Duration::from_secs(20);
+const HANDSHAKE_REPLY_TTL: Duration = Duration::from_secs(50);
 
 /// An outgoing connection attempt that has not completed by then counts as
 /// failed (and is retried with backoff). Without a bound, a slow attempt (some
 /// take minutes) holds one of the `max_parallel` dial slots the whole time.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(25);
+/// Long enough for a punch against a RANDOM-class NAT (up to ~35 s of probes)
+/// plus the handshake before it and the stream after it.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// How long a server handshake may spend sampling our NAT from the puncher
 /// socket. The sampling runs inside the swarm's event loop; Node runs it in the
@@ -1593,9 +1595,14 @@ impl SwarmActor {
             true
         })?;
 
+        // Long enough for a whole punch: against a RANDOM-class NAT the two sides run up to
+        // 1750 probes 20 ms apart (~35 s, holepuncher.rs) before a birthday socket lands, and
+        // the stream must still be listening then. A fixed 10 s cut most such punches short.
+        // (The client's firewall class is often still UNKNOWN at handshake time, so this does
+        // not depend on it: the timer only bounds how long a failed attempt is kept.)
         let abort_tx = self.passive_hp_event_tx.clone();
         let abort_task = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(10)).await;
+            tokio::time::sleep(Duration::from_secs(40)).await;
             let _ = abort_tx.send(PassiveHolepunchEvent::Abort { id: holepunch_id });
         });
 

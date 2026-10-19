@@ -1974,7 +1974,7 @@ impl HyperDhtHandle {
                 tokio::select! {
                     ev = event_rx.recv() => {
                         match ev {
-                            Some(HolepunchEvent::Connected { addr }) => {
+                            Some(HolepunchEvent::Connected { addr, socket }) => {
                                 tracing::info!(
                                     target: "peeroxide::_events::holepunch::connected",
                                     from = %addr,
@@ -1992,7 +1992,9 @@ impl HyperDhtHandle {
                                     noise: nw_result.clone(),
                                     local_stream_id,
                                     remote_udx: remote_payload.udx.clone(),
-                                    udx_socket: puncher_udx,
+                                    // The socket the probe arrived on (a birthday socket
+                                    // behind a RANDOM NAT), else the primary one.
+                                    udx_socket: socket.or(puncher_udx),
                                 });
                             }
                             Some(HolepunchEvent::Aborted) | None => {
